@@ -7,8 +7,9 @@ use uv_client::MetadataFormat;
 use uv_configuration::BuildOptions;
 use uv_distribution::{DistributionDatabase, Reporter};
 use uv_distribution_types::{
-    Dist, File, IndexCapabilities, IndexLocations, IndexMetadata, IndexMetadataRef, IndexUrl,
-    InstalledDist, MinimumLibcVersion, RequestedDist, RequiresPython,
+    BuiltDist, Dist, File, IndexCapabilities, IndexLocations, IndexMetadata, IndexMetadataRef,
+    IndexUrl, InstalledDist, MinimumLibcVersion, RequestedDist, RequiresPython,
+    VariantsJsonContent,
 };
 use uv_normalize::PackageName;
 use uv_platform_tags::Tags;
@@ -66,6 +67,12 @@ pub trait ResolverProvider {
         &'io self,
         dist: &'io Dist,
     ) -> impl Future<Output = WheelMetadataResult> + 'io;
+
+    /// Get embedded variant metadata for a wheel at a local or Git path.
+    fn get_wheel_variant_metadata<'io>(
+        &'io self,
+        wheel: &'io BuiltDist,
+    ) -> impl Future<Output = Result<Option<VariantsJsonContent>, uv_distribution::Error>> + 'io;
 
     /// Get the metadata for an installed distribution.
     fn get_installed_metadata<'io>(
@@ -328,6 +335,13 @@ impl<Context: BuildContext> ResolverProvider for DefaultResolverProvider<'_, Con
                 )),
             },
         }
+    }
+
+    async fn get_wheel_variant_metadata(
+        &self,
+        wheel: &BuiltDist,
+    ) -> Result<Option<VariantsJsonContent>, uv_distribution::Error> {
+        self.fetcher.get_wheel_variant_metadata(wheel).await
     }
 
     /// Return the metadata for an installed distribution.
