@@ -8,7 +8,7 @@ use uv_platform_tags::Platform;
 use uv_preview::PreviewFeature;
 use uv_pypi_types::{HashDigest, HashDigests, ResolutionMetadata};
 
-use crate::{Error, supported_variant_properties};
+use crate::{Error, detect_variant_properties};
 
 /// Allow variant wheels from an index when the wheel variants preview is enabled.
 pub fn check_supported_wheel_variant(dist: &BuiltDist) -> Result<(), Error> {
@@ -39,11 +39,13 @@ pub(crate) fn check_wheel_variant_compatibility(
     let path = archive.join(format!("{dist_info}.dist-info/variant.json"));
     let metadata = read_wheel_variant(&path, label)
         .map_err(|err| Error::WheelMetadata(path, Box::new(err)))?;
-    let supported = supported_variant_properties(&metadata, target);
-    if let Some(properties) = metadata.unsupported_variant_properties(label, &supported) {
+    let detection = detect_variant_properties(&metadata, target);
+    if let Some(properties) = metadata.unsupported_variant_properties(label, detection.supported())
+    {
         return Err(Error::IncompatibleWheelVariant {
             label: label.clone(),
             properties,
+            provider_errors: detection.errors_for(&metadata, label).cloned().collect(),
         });
     }
     Ok(())
