@@ -43,7 +43,6 @@ use uv_threads::initialize_rayon_once;
 use uv_types::{BuildContext, BuildStack};
 
 use crate::archive::Archive;
-use crate::download::check_wheel_variant_compatibility;
 use crate::error::PythonVersion;
 use crate::extracted_wheel::{ExtractedWheel, HashedWheel, WheelExtractor};
 use crate::hash::http_hash_algorithms;
@@ -226,13 +225,7 @@ impl<'a, Context: BuildContext> DistributionDatabase<'a, Context> {
         match dist {
             Dist::Built(built) => {
                 check_supported_wheel_variant(built)?;
-                let wheel = self.get_wheel(built, hashes).await?;
-                check_wheel_variant_compatibility(
-                    &wheel.filename,
-                    &wheel.archive,
-                    tags.python_platform(),
-                )?;
-                Ok(wheel)
+                self.get_wheel(built, hashes).await
             }
             // TODO(konsti): Support source distributions that build variant wheels.
             // For now, `build_wheel` assumes a non-variant wheel compatible with `tags`.

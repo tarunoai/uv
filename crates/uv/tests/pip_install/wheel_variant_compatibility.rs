@@ -1,11 +1,15 @@
 use std::collections::BTreeMap;
+use std::str::FromStr;
 
 use anyhow::Result;
 use assert_fs::prelude::*;
 use indoc::indoc;
 use insta::{assert_json_snapshot, assert_snapshot};
 use serde_json::{Map, Value, json};
+use uv_distribution_filename::VariantLabel;
 use uv_distribution_types::PEP_850_SCHEMA;
+use uv_normalize::PackageName;
+use uv_pep440::Version;
 use uv_static::EnvVars;
 use uv_test::find_links::FindLinksServer;
 use uv_test::packse::{PackseServer, WheelBuilder};
@@ -403,6 +407,227 @@ fn x86_64_without_ctypes_installs_v2() -> Result<()> {
       }
     }
     "#);
+    Ok(())
+}
+
+const ABI_DEPENDENCY_WHEELS: &str = indoc! {r#"
+    name = "abi-dependency"
+    root = {}
+
+    [expected]
+    satisfiable = true
+
+    [packages.extension.versions."1.0.0"]
+    wheel = false
+    sdist = false
+
+    [packages.extension.versions."1.0.0".variants]
+    namespaces = ["abi_dependency"]
+    providers.abi_dependency.builtin = "abi_dependency"
+
+    [packages.extension.versions."1.0.0".variants.wheels]
+    torch28.properties = ["abi_dependency :: torch :: 2.8"]
+    torch28.requires = ["torch==2.8.*"]
+    torch29.properties = ["abi_dependency :: torch :: 2.9"]
+    torch29.requires = ["torch==2.9.*"]
+
+    [packages.torch.versions."2.8.1"]
+    [packages.torch.versions."2.9.1"]
+"#};
+
+/// Without a runtime constraint, the first equally ranked wheel supplies its own Torch pin.
+#[test]
+fn install_selected_wheel_abi_dependency() -> Result<()> {
+    let context = uv_test::test_context!("3.12");
+    let server = PackseServer::from_toml(ABI_DEPENDENCY_WHEELS)?;
+
+    uv_snapshot!(context.filters(), context.pip_install()
+        .arg("--index-url")
+        .arg(server.index_url())
+        .arg("--preview-features")
+        .arg("wheel-variants")
+        .arg("extension"), @"
+    exit_code: 0 (success)
+    ----- stderr -----
+    Resolved 2 packages in [TIME]
+    Prepared 2 packages in [TIME]
+    Installed 2 packages in [TIME]
+     + extension==1.0.0
+     + torch==2.8.1
+    ");
+    Ok(())
+}
+
+/// An explicit Torch pin rules out the otherwise preferred wheel.
+#[test]
+fn select_wheel_by_abi_dependency_pin() -> Result<()> {
+    let context = uv_test::test_context!("3.12");
+    let server = PackseServer::from_toml(ABI_DEPENDENCY_WHEELS)?;
+
+    uv_snapshot!(context.filters(), context.pip_install()
+        .arg("--index-url")
+        .arg(server.index_url())
+        .arg("--preview-features")
+        .arg("wheel-variants")
+        .arg("extension")
+        .arg("torch==2.9.1"), @"
+    exit_code: 0 (success)
+    ----- stderr -----
+    Resolved 2 packages in [TIME]
+    Prepared 2 packages in [TIME]
+    Installed 2 packages in [TIME]
+     + extension==1.0.0
+     + torch==2.9.1
+    ");
+    let installed = context.read(
+        context
+            .site_packages()
+            .join("extension-1.0.0.dist-info/variant.json"),
+    );
+    let metadata: Value = serde_json::from_str(&installed)?;
+    assert_json_snapshot!(metadata["variants"], @r#"
+    {
+      "torch29": {
+        "abi_dependency": {
+          "torch": [
+            "2.9"
+          ]
+        }
+      }
+    }
+    "#);
+    Ok(())
+}
+
+/// The preferred wheel's ABI is incompatible with the only available Torch version.
+/// Both wheels declare the same ordinary dependency, so either can supply the metadata.
+#[test]
+fn retry_abi_wheel_for_resolved_runtime() -> Result<()> {
+    let context = uv_test::test_context!("3.12");
+    let server = PackseServer::from_toml(indoc! {r#"
+        name = "abi-wheel-choice"
+        root = {}
+
+        [expected]
+        satisfiable = true
+
+        [packages.extension.versions."1.0.0"]
+        wheel = false
+        sdist = false
+        requires = ["torch"]
+
+        [packages.extension.versions."1.0.0".variants]
+        namespaces = ["abi_dependency"]
+        providers.abi_dependency.builtin = "abi_dependency"
+
+        [packages.extension.versions."1.0.0".variants.wheels]
+        torch28.properties = ["abi_dependency :: torch :: 2.8"]
+        torch29.properties = ["abi_dependency :: torch :: 2.9"]
+
+        [packages.torch.versions."2.9.1"]
+    "#})?;
+
+    uv_snapshot!(context.filters(), context.pip_install()
+        .arg("--index-url")
+        .arg(server.index_url())
+        .arg("--preview-features")
+        .arg("wheel-variants")
+        .arg("extension"), @"
+    exit_code: 0 (success)
+    ----- stderr -----
+    Resolved 2 packages in [TIME]
+    Prepared 2 packages in [TIME]
+    Installed 2 packages in [TIME]
+     + extension==1.0.0
+     + torch==2.9.1
+    ");
+    Ok(())
+}
+
+/// Once resolution drops the release, an incompatible Torch must not require any wheel.
+#[test]
+fn discarded_abi_release_requires_no_wheel() -> Result<()> {
+    let context = uv_test::test_context!("3.12");
+    let server = PackseServer::from_toml(indoc! {r#"
+        name = "discarded-abi-release"
+        root = {}
+
+        [expected]
+        satisfiable = true
+
+        [packages.parent.versions."2.0.0"]
+        requires = ["extension"]
+        [packages.parent.versions."1.0.0"]
+
+        [packages.extension.versions."1.0.0"]
+        wheel = false
+        sdist = false
+        requires = ["torch"]
+        [packages.extension.versions."1.0.0".variants]
+        namespaces = ["abi_dependency"]
+        providers.abi_dependency.builtin = "abi_dependency"
+        [packages.extension.versions."1.0.0".variants.wheels]
+        torch29.properties = ["abi_dependency :: torch :: 2.9"]
+
+        [packages.torch.versions."2.10.1"]
+    "#})?;
+
+    uv_snapshot!(context.filters(), context.pip_install()
+        .arg("--index-url")
+        .arg(server.index_url())
+        .arg("--preview-features")
+        .arg("wheel-variants")
+        .arg("parent")
+        .arg("torch"), @"
+    exit_code: 0 (success)
+    ----- stderr -----
+    Resolved 2 packages in [TIME]
+    Prepared 2 packages in [TIME]
+    Installed 2 packages in [TIME]
+     + parent==1.0.0
+     + torch==2.10.1
+    ");
+    Ok(())
+}
+
+/// The index and wheel name different missing runtimes. Resolution should succeed, and
+/// preparing the wheel should report the runtime from its embedded ABI metadata.
+#[test]
+fn wheel_variant_index_cannot_add_dependencies() -> Result<()> {
+    let context = uv_test::test_context!("3.12");
+    let links = context.temp_dir.child("links");
+    links.create_dir_all()?;
+    let mut variant = json!({
+        "$schema": PEP_850_SCHEMA,
+        "default-priorities": { "namespace": ["abi_dependency"] },
+        "providers": { "abi_dependency": { "builtin": "abi_dependency" } },
+        "variants": { "example": { "abi_dependency": { "torch": ["2.9"] } } },
+    });
+    let (filename, wheel) = WheelBuilder::new(
+        &PackageName::from_str("extension")?,
+        &Version::new([1, 0, 0]),
+    )
+    .variant(&VariantLabel::from_static("example"), &variant.to_string())
+    .build();
+    links.child(filename).write_binary(&wheel)?;
+    variant["variants"]["example"] = json!({ "abi_dependency": { "other": ["1"] } });
+    links
+        .child("extension-1.0.0-variants.json")
+        .write_str(&variant.to_string())?;
+
+    uv_snapshot!(context.filters(), context.pip_install()
+        .arg("--no-index")
+        .arg("--find-links")
+        .arg(links.path())
+        .arg("--preview-features")
+        .arg("wheel-variants")
+        .arg("extension"), @"
+    exit_code: 1 (failure)
+    ----- stderr -----
+    Resolved 1 package in [TIME]
+    error: Failed to download `extension==1.0.0`
+      cause: Wheel variant `example` requires unsupported properties: `abi_dependency :: torch :: 2.9`
+    ");
     Ok(())
 }
 

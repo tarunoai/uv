@@ -9,6 +9,11 @@ use serde::{Deserialize, Serialize};
 use tracing::debug;
 
 use uv_distribution_filename::VariantLabel;
+use uv_normalize::PackageName;
+use uv_pep440::{Version, VersionSpecifier};
+use version_ranges::Ranges;
+
+use crate::{Name, Resolution, ResolvedDist};
 
 // TODO(konsti): Standardize on a single schema URL once the variant metadata format is finalized.
 /// The PEP 825 draft schema for variant metadata without providers.
@@ -147,9 +152,39 @@ impl VariantsJsonContent {
         }
     }
 
+    fn is_abi_dependency(&self, namespace: &VariantNamespace) -> bool {
+        let Some(VariantProvider {
+            kind: ProviderKind::Builtin { builtin },
+            optional: false,
+        }) = self
+            .providers
+            .as_ref()
+            .and_then(|providers| providers.get(namespace))
+        else {
+            return false;
+        };
+        *builtin == BuiltinProvider::AbiDependency
+    }
+
+    /// Collect the ABI requirements if the label exists and all its requirements are valid.
+    pub fn abi_dependencies(
+        &self,
+        label: &VariantLabel,
+    ) -> Option<Vec<(PackageName, Ranges<Version>)>> {
+        let mut dependencies = Vec::new();
+        for (namespace, features) in self.variants.get(label)? {
+            if self.is_abi_dependency(namespace) {
+                for (feature, values) in features {
+                    dependencies.push(abi_dependency(feature, values)?);
+                }
+            }
+        }
+        Some(dependencies)
+    }
+
     /// Score a variant using the target's ordered compatible features and values.
     ///
-    /// Returns `None` if the label is missing or any of its features is unsupported.
+    /// The resolver checks [`Self::abi_dependencies`] separately against the runtime constraints.
     pub fn score_variant(
         &self,
         label: &VariantLabel,
@@ -164,6 +199,10 @@ impl VariantsJsonContent {
                 .namespace
                 .iter()
                 .position(|name| name == namespace)?;
+            if self.is_abi_dependency(namespace) {
+                properties.insert((namespace_priority, 0, 0));
+                continue;
+            }
             let supported_features = supported_properties.properties.get(namespace)?;
             for (feature, values) in features {
                 let (feature_priority, value_priority) =
@@ -183,6 +222,7 @@ impl VariantsJsonContent {
         &self,
         label: &VariantLabel,
         supported_properties: &SupportedVariantProperties,
+        resolution: &Resolution,
     ) -> Option<UnsupportedVariantProperties> {
         let properties = self.variants.get(label)?;
         let mut unsupported = BTreeMap::new();
@@ -191,6 +231,16 @@ impl VariantsJsonContent {
             let unsupported_features = features
                 .iter()
                 .filter(|(feature, values)| {
+                    if self.is_abi_dependency(namespace) {
+                        let Some((name, versions)) = abi_dependency(feature, values) else {
+                            return true;
+                        };
+                        return resolution
+                            .distributions()
+                            .find(|dist| dist.name() == &name)
+                            .and_then(ResolvedDist::version)
+                            .is_none_or(|version| !versions.contains(version));
+                    }
                     supported_features
                         .and_then(|supported| score_feature(supported, feature, values))
                         .is_none()
@@ -270,7 +320,13 @@ impl VariantsJsonContent {
                         requires,
                         plugin_api: plugin_api.as_deref(),
                     },
-                    ProviderKind::Builtin { builtin } => VariantProviderRequest::Builtin(builtin),
+                    // ABI compatibility is checked against dependency versions in the resolution.
+                    ProviderKind::Builtin {
+                        builtin: BuiltinProvider::AbiDependency,
+                    } => return None,
+                    ProviderKind::Builtin {
+                        builtin: BuiltinProvider::Unknown(name),
+                    } => VariantProviderRequest::Builtin(name),
                     ProviderKind::Static { .. } => return None,
                 };
                 Some((namespace, request))
@@ -343,8 +399,25 @@ enum ProviderKind {
         plugin_api: Option<String>,
     },
     Builtin {
-        builtin: String,
+        builtin: BuiltinProvider,
     },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(from = "String", rename_all = "snake_case")]
+enum BuiltinProvider {
+    AbiDependency,
+    #[serde(untagged)]
+    Unknown(String),
+}
+
+impl From<String> for BuiltinProvider {
+    fn from(name: String) -> Self {
+        match name.as_str() {
+            "abi_dependency" => Self::AbiDependency,
+            _ => Self::Unknown(name),
+        }
+    }
 }
 
 #[derive(Deserialize)]
@@ -516,6 +589,32 @@ impl TryFrom<VariantsJsonWire> for VariantsJsonContent {
             variants: wire.variants,
         })
     }
+}
+
+/// ABI features name a distribution and list the release prefixes it can provide.
+fn abi_dependency(
+    feature: &VariantFeature,
+    values: &[VariantValue],
+) -> Option<(PackageName, Ranges<Version>)> {
+    let name = PackageName::from_str(&feature.0).ok()?;
+    if name.as_dist_info_name() != feature.0.as_ref() {
+        return None;
+    }
+    let mut versions = Ranges::empty();
+    for value in values {
+        let version = Version::from_str(&value.0).ok()?;
+        let release = version.release();
+        if release.len() > 3 || version.only_release().to_string() != value.0.as_ref() {
+            return None;
+        }
+        // TODO(konsti): Support a final u64::MAX component once wildcard range conversion
+        // can compute its upper bound without incrementing that component.
+        if release.last() == Some(&u64::MAX) {
+            return None;
+        }
+        versions = versions.union(&VersionSpecifier::equals_star_version(version).into());
+    }
+    Some((name, versions))
 }
 
 /// The schema field alone, used to identify unknown schemas when parsing fails.
